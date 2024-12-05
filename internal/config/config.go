@@ -26,10 +26,10 @@ func DefaultConfig() *Config {
 		DiscoveryPort:  7946,
 
 		// Health check defaults
-		HealthInterval:    time.Second * 5,
-		SuspectTimeout:    time.Second * 30,
-		DeadTimeout:       time.Second * 60,
-		NodeRemovalDelay:  time.Minute * 2,
+		HealthInterval:    time.Second * 5,     // Check every 5 seconds
+		SuspectTimeout:    time.Second * 10,    // Mark as suspect after 10 seconds
+		DeadTimeout:       time.Second * 20,    // Mark as dead after 20 seconds
+		NodeRemovalDelay:  time.Second * 30,    // Remove after 30 seconds
 
 		// Discovery defaults
 		DiscoveryRetryInterval: time.Second * 10,

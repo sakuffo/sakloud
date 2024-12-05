@@ -14,6 +14,9 @@ func (c *Cluster) StartHealthCheck() {
 	c.logger.Info("Starting health check service with %v interval", c.config.HealthInterval)
 	c.healthCheck = time.NewTicker(c.config.HealthInterval)
 
+	// Start heartbeat goroutine
+	go c.runHeartbeat()
+
 	go func() {
 		for {
 			select {
@@ -27,12 +30,54 @@ func (c *Cluster) StartHealthCheck() {
 	}()
 }
 
-func (c *Cluster) checkNodes() {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
+// runHeartbeat periodically updates the local node's LastSeen time
+func (c *Cluster) runHeartbeat() {
+	heartbeatTicker := time.NewTicker(c.config.HealthInterval / 2) // More frequent than health check
+	defer heartbeatTicker.Stop()
 
-	c.logger.Debug("Starting health check cycle for %d nodes", len(c.nodes))
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-heartbeatTicker.C:
+			c.mutex.Lock()
+			if localNode, exists := c.nodes[c.localNode.ID]; exists {
+				localNode.LastSeen = time.Now()
+				c.logger.Debug("Updated local node heartbeat")
+			}
+			c.mutex.Unlock()
+		}
+	}
+}
+
+func (c *Cluster) checkNodes() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	now := time.Now()
+	nodeCount := len(c.nodes)
+
+	// Log detailed node states only when there are changes or every minute
+	shouldLogDetails := false
+	if c.lastDetailedLog.IsZero() || now.Sub(c.lastDetailedLog) >= time.Minute {
+		shouldLogDetails = true
+		c.lastDetailedLog = now
+	}
+
+	if shouldLogDetails {
+		c.logger.Debug("Current cluster state - %d nodes (local node ID: %s)", nodeCount, c.localNode.ID)
+		for id, node := range c.nodes {
+			lastSeenAgo := now.Sub(node.LastSeen).Round(time.Second)
+			nodeType := "remote"
+			if id == c.localNode.ID {
+				nodeType = "local"
+			}
+			c.logger.Debug("%s node state - ID: %s, Name: %s, Address: %s, State: %v, LastSeen: %v ago",
+				nodeType, id, node.Name, node.Address, node.State, lastSeenAgo)
+		}
+	} else {
+		c.logger.Debug("Health check cycle - %d nodes", nodeCount)
+	}
 
 	for _, node := range c.nodes {
 		select {
@@ -42,23 +87,31 @@ func (c *Cluster) checkNodes() {
 			c.checkNodeHealth(node, now)
 		}
 	}
-	c.logger.Debug("Health check cycle complete")
 }
 
 func (c *Cluster) checkNodeHealth(node *Node, now time.Time) {
 	lastSeenDuration := now.Sub(node.LastSeen)
-	c.logger.Debug("Checking node %s (ID: %s), last seen %v ago",
-		node.Name, node.ID, lastSeenDuration.Round(time.Second))
+	isLocal := node.ID == c.localNode.ID
+	nodeType := "remote"
+	if isLocal {
+		nodeType = "local"
+	}
+	
+	// Log health check details when approaching timeouts
+	if lastSeenDuration >= c.config.SuspectTimeout/2 {
+		c.logger.Debug("Checking %s node health - Name: %s, ID: %s, State: %v, LastSeen: %v ago",
+			nodeType, node.Name, node.ID, node.State, lastSeenDuration.Round(time.Second))
+	}
 
 	if lastSeenDuration > c.config.SuspectTimeout && node.State == Alive {
-		c.logger.Warn("Node %s (%s) hasn't been seen for %v, marking as suspect",
-			node.Name, node.Address, lastSeenDuration.Round(time.Second))
+		c.logger.Warn("%s node %s (%s) hasn't been seen for %v (suspect timeout: %v), marking as suspect",
+			nodeType, node.Name, node.Address, lastSeenDuration.Round(time.Second), c.config.SuspectTimeout)
 		c.markNodeSuspect(node)
 	}
 
 	if lastSeenDuration > c.config.DeadTimeout && node.State != Dead {
-		c.logger.Warn("Node %s (%s) hasn't been seen for %v, marking as dead",
-			node.Name, node.Address, lastSeenDuration.Round(time.Second))
+		c.logger.Warn("%s node %s (%s) hasn't been seen for %v (dead timeout: %v), marking as dead",
+			nodeType, node.Name, node.Address, lastSeenDuration.Round(time.Second), c.config.DeadTimeout)
 		c.markNodeDead(node)
 	}
 }

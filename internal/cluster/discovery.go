@@ -54,7 +54,8 @@ func (c *Cluster) discover(serviceName string) {
 			c.logger.Info("Discovery service stopping due to context cancellation")
 			return
 		case <-ticker.C:
-			c.logger.Debug("Starting new discovery cycle")
+			c.logger.Debug("Starting new discovery cycle (service: %s, retry interval: %v)", 
+				serviceName, c.config.DiscoveryRetryInterval)
 			if err := c.runDiscoveryCycle(serviceName); err != nil {
 				c.logger.Error("Discovery cycle failed: %v", err)
 			}
@@ -62,29 +63,22 @@ func (c *Cluster) discover(serviceName string) {
 	}
 }
 
+// runDiscoveryCycle performs a single discovery cycle
 func (c *Cluster) runDiscoveryCycle(serviceName string) error {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
 		return fmt.Errorf("failed to create resolver: %w", err)
 	}
 
-	entries := make(chan *zeroconf.ServiceEntry, c.config.DiscoveryBufferSize)
+	entries := make(chan *zeroconf.ServiceEntry)
 	ctx, cancel := context.WithTimeout(c.ctx, c.config.DiscoveryTimeout)
 	defer cancel()
 
-	go func(results <-chan *zeroconf.ServiceEntry) {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case entry, ok := <-results:
-				if !ok {
-					return
-				}
-				c.handleDiscoveredNode(entry)
-			}
+	go func() {
+		for entry := range entries {
+			c.handleDiscoveredNode(entry)
 		}
-	}(entries)
+	}()
 
 	if err := resolver.Browse(ctx, serviceName, "local.", entries); err != nil {
 		return fmt.Errorf("failed to browse services: %w", err)
@@ -94,36 +88,61 @@ func (c *Cluster) runDiscoveryCycle(serviceName string) error {
 }
 
 func (c *Cluster) handleDiscoveredNode(entry *zeroconf.ServiceEntry) {
-	// Skip our own node
-	if entry.AddrIPv4[0].String() == c.localNode.Address.String() {
-		c.logger.Debug("Skipping own node entry: %s", entry.Instance)
-		return
-	}
-
+	// Extract node ID from TXT records
 	var nodeID string
+	metadata := make(map[string]string)
+	
+	// Process all TXT records
 	for _, txt := range entry.Text {
-		if strings.HasPrefix(txt, "id=") {
-			nodeID = strings.TrimPrefix(txt, "id=")
-			break
+		if parts := strings.SplitN(txt, "=", 2); len(parts) == 2 {
+			if parts[0] == "id" {
+				nodeID = parts[1]
+			}
+			metadata[parts[0]] = parts[1]
 		}
 	}
 
 	if nodeID == "" {
-		c.logger.Warn("Received entry without node ID: %s", entry.Instance)
+		c.logger.Debug("Discovered node missing ID in TXT records - Host: %s, IP: %v, Port: %d",
+			entry.HostName, entry.AddrIPv4, entry.Port)
 		return
 	}
 
-	node := &Node{
-		ID:       nodeID,
-		Name:     entry.Instance,
-		Address:  entry.AddrIPv4[0],
-		Port:     entry.Port,
-		State:    Alive,
-		LastSeen: time.Now(),
-		Metadata: make(map[string]string),
+	if nodeID == c.localNode.ID {
+		c.logger.Debug("Skipping discovery of our own node (ID: %s, Host: %s)",
+			nodeID, entry.HostName)
+		return
 	}
 
-	c.AddNode(node)
-	c.logger.Debug("Discovered node: %s (ID: %s, Address: %s:%d)",
-		node.Name, node.ID, node.Address, node.Port)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// Check if we already know about this node
+	if existingNode, exists := c.nodes[nodeID]; exists {
+		c.logger.Debug("Updating existing node - ID: %s, Name: %s, Address: %s, Last State: %v",
+			nodeID, existingNode.Name, existingNode.Address, existingNode.State)
+		existingNode.LastSeen = time.Now()
+		if existingNode.State == Suspect {
+			c.logger.Info("Node %s recovered from suspect state", existingNode.Name)
+			existingNode.State = Alive
+			c.notifySubscribers(ClusterEvent{
+				Type:      NodeStateChange,
+				Node:      existingNode,
+				Timestamp: time.Now(),
+			})
+		}
+	} else {
+		// Create new node
+		newNode := NewNode(entry.HostName, entry.AddrIPv4[0], entry.Port)
+		newNode.ID = nodeID
+		newNode.Metadata = metadata
+		c.nodes[nodeID] = newNode
+		c.logger.Debug("Added new node to cluster - ID: %s, Name: %s, Address: %s",
+			newNode.ID, newNode.Name, newNode.Address)
+		c.notifySubscribers(ClusterEvent{
+			Type:      NodeJoin,
+			Node:      newNode,
+			Timestamp: time.Now(),
+		})
+	}
 }

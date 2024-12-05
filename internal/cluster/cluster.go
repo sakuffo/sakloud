@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"net"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ type Cluster struct {
 	config      *config.Config
 	healthCheck *time.Ticker
 	discoveryWG sync.WaitGroup
+	lastDetailedLog time.Time  // Tracks when we last logged detailed node states
 }
 
 // NewCluster initializes a new cluster with the local node.
@@ -50,21 +52,29 @@ func NewCluster(ctx context.Context, localNode *Node, log logger.Logger, cfg *co
 		logger:    log,
 		config:    cfg,
 	}
+
+	// Add local node to the nodes map
+	c.nodes[localNode.ID] = localNode
+
 	c.logger.Info("Created new cluster with local node: %s (ID: %s, Address: %s:%d)",
 		localNode.Name, localNode.ID, localNode.Address, localNode.Port)
 	return c
 }
 
-// AddNode adds a node to the cluster or updates its last seen time if it already exists.
+// AddNode adds a node to the cluster or updates an existing one.
 // This method is thread-safe.
 func (c *Cluster) AddNode(node *Node) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	// Skip if trying to add our own node
+	if node.ID == c.localNode.ID {
+		c.logger.Debug("Skipping add/update of our own node ID: %s", node.ID)
+		return
+	}
+
 	if existing, exists := c.nodes[node.ID]; exists {
-		existing.LastSeen = time.Now()
-		c.logger.Debug("Updated last seen time for node: %s (ID: %s, Address: %s:%d)",
-			node.Name, node.ID, node.Address, node.Port)
+		c.updateNodeInfo(existing, node.Address, node.Port)
 		return
 	}
 
@@ -73,6 +83,48 @@ func (c *Cluster) AddNode(node *Node) {
 		node.Name, node.ID, node.Address, node.Port)
 	c.notifySubscribers(ClusterEvent{
 		Type:      NodeJoin,
+		Node:      node,
+		Timestamp: time.Now(),
+	})
+}
+
+// updateNodeInfo updates a node's network information and state.
+// Caller must hold the cluster mutex.
+func (c *Cluster) updateNodeInfo(node *Node, newAddress net.IP, newPort int) {
+	// Update last seen time
+	oldLastSeen := node.LastSeen
+	node.LastSeen = time.Now()
+	
+	c.logger.Debug("Updating node %s (ID: %s) - Last seen delta: %v",
+		node.Name, node.ID, node.LastSeen.Sub(oldLastSeen))
+	
+	// Check and update network info
+	if !node.Address.Equal(newAddress) {
+		c.logger.Info("Node %s (ID: %s) address changed from %s to %s",
+			node.Name, node.ID, node.Address, newAddress)
+		node.Address = newAddress
+	}
+	
+	if node.Port != newPort {
+		c.logger.Info("Node %s (ID: %s) port changed from %d to %d",
+			node.Name, node.ID, node.Port, newPort)
+		node.Port = newPort
+	}
+
+	// Check if node needs to be revived
+	if node.State != Alive {
+		c.reviveNode(node)
+	}
+}
+
+// reviveNode marks a previously suspect or dead node as alive
+func (c *Cluster) reviveNode(node *Node) {
+	oldState := node.State
+	node.State = Alive
+	c.logger.Info("Node %s (ID: %s) state changed from %v to %v",
+		node.Name, node.ID, oldState, Alive)
+	c.notifySubscribers(ClusterEvent{
+		Type:      NodeStateChange,
 		Node:      node,
 		Timestamp: time.Now(),
 	})
@@ -133,4 +185,17 @@ func (c *Cluster) Shutdown() error {
 
 	c.logger.Info("Cluster shutdown complete for node: %s", c.localNode.Name)
 	return nil
+}
+
+// GetNode returns a node by its ID if it exists in the cluster
+func (c *Cluster) GetNode(id string) (*Node, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	node, exists := c.nodes[id]
+	return node, exists
+}
+
+// IsLocalNode checks if the given node ID matches the local node
+func (c *Cluster) IsLocalNode(id string) bool {
+	return id == c.localNode.ID
 }

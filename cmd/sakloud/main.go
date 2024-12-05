@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,13 +15,67 @@ import (
 	"github.com/sakuffo/sakloud/internal/logger"
 )
 
+var (
+	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error, fatal)")
+)
+
+func parseLogLevel(level string) logger.Level {
+	switch strings.ToLower(level) {
+	case "debug":
+		return logger.DebugLevel
+	case "warn":
+		return logger.WarnLevel
+	case "error":
+		return logger.ErrorLevel
+	case "fatal":
+		return logger.FatalLevel
+	default:
+		return logger.InfoLevel
+	}
+}
+
+// isLinkLocal checks if an IP is a link-local address (169.254.x.x)
+func isLinkLocal(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 169 && ip4[1] == 254
+	}
+	return false
+}
+
+// isLoopback checks if an IP is a loopback address (127.x.x.x)
+func isLoopback(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 127
+	}
+	return false
+}
+
+// isPrivateNetwork checks if an IP is in private network ranges
+func isPrivateNetwork(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		// Check for private network ranges:
+		// 10.0.0.0/8
+		// 172.16.0.0/12
+		// 192.168.0.0/16
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) ||
+			(ip4[0] == 192 && ip4[1] == 168)
+	}
+	return false
+}
+
 func main() {
+	flag.Parse()
+
 	// Initialize logger
 	log, err := logger.New("sakloud")
 	if err != nil {
 		panic(err)
 	}
 	defer log.Close()
+
+	// Set log level from command line flag
+	log.SetLevel(parseLogLevel(*logLevel))
 
 	log.Info("Starting Sakloud...")
 
@@ -37,18 +93,9 @@ func main() {
 		log.Fatal("Failed to get interface addresses: %v", err)
 	}
 
-	var localIP net.IP
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				localIP = ipnet.IP
-				break
-			}
-		}
-	}
-
+	localIP := cluster.SelectBestIP(addrs)
 	if localIP == nil {
-		log.Fatal("Could not find suitable local IP address")
+		log.Fatal("Could not find suitable local IP address (non-link-local, non-loopback)")
 	}
 	log.Info("Using local IP: %s", localIP.String())
 
