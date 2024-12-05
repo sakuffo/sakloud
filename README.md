@@ -19,7 +19,7 @@ A distributed cloud storage system written in Go.
 ### Installation
 
 ```bash
-go get github.com/yourusername/sakloud
+go get github.com/sakuffo/sakloud
 ```
 
 ### Running
