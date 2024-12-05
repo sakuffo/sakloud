@@ -44,7 +44,7 @@ func New(appName string) (*DefaultLogger, error) {
 	}
 
 	// Create log file with timestamp
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	timestamp := time.Now().Format("2006-01-02_15")
 	logPath := filepath.Join(logsDir, fmt.Sprintf("%s_%s.log", appName, timestamp))
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
@@ -95,4 +95,4 @@ func (l *DefaultLogger) Fatal(format string, v ...interface{}) {
 
 func (l *DefaultLogger) Close() error {
 	return l.file.Close()
-} 
+}
