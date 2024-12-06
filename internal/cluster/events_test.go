@@ -29,6 +29,9 @@ func TestClusterEvents(t *testing.T) {
 		}
 
 		// Verify event properties
+		if event.Type != e.eventType {
+			t.Errorf("Expected event type %v, got %v", e.eventType, event.Type)
+		}
 		if event.Node != node {
 			t.Errorf("Expected node reference to match for event type %v", e.eventType)
 		}
