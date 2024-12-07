@@ -100,7 +100,7 @@ func (ls *LocalStorage) Write(ctx context.Context, name string, reader io.Reader
 			FileID:   fileID,
 			Index:    chunkIndex,
 			Size:     int64(n),
-Checksum: chunkChecksum,
+			Checksum: chunkChecksum,
 		}
 
 		// Write chunk to file
@@ -125,4 +125,80 @@ Checksum: chunkChecksum,
 	ls.metaMutex.Unlock()
 
 	return fileInfo, nil
+}
+
+// Read reads a file from storage and returns a reader for the file content
+func (ls *LocalStorage) Read(ctx context.Context, fileID string) (io.Reader, *FileInfo, error) {
+	ls.closeMutex.RLock()
+	if ls.closed {
+		ls.closeMutex.RUnlock()
+		return nil, nil, ErrStorageClosed
+	}
+	ls.closeMutex.RUnlock()
+
+	// Get file metadata
+	ls.metaMutex.RLock()
+	fileInfo, exists := ls.metadata[fileID]
+	ls.metaMutex.RUnlock()
+
+	if !exists {
+		return nil, nil, fmt.Errorf("file not found: %s", fileID)
+	}
+
+	// Create a pipe stream the file content
+	pr, pw := io.Pipe()
+
+	// Start a goroutine to write chunks to the pipe
+	go func() {
+		defer pw.Close()
+
+		// Create a hasher for verifying file checksum
+		hasher := sha256.New()
+
+		// Read and verify each chunk
+		for _, chunk := range fileInfo.ChunkSize {
+			select {
+			case <-ctx.Done():
+				pw.CloseWithError(ctx.Err())
+				return
+			default:
+			}
+
+			// Read chunk file
+			chunkPath := filepath.Join(ls.basePath, "chunks", fileID, fmt.Sprintf("%d.dat", chunk.Index))
+			data, err := os.ReadFile(chunkPath)
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("failed to read chunk %d: %w", chunk.Index, err))
+				return
+			}
+
+			// Verify chunk checksum
+			chunkHasher := sha256.New()
+			chunkHasher.Write(data)
+			checksum := hex.EncodeToString(chunkHasher.Sum(nil))
+			if checksum != chunk.Checksum {
+				pw.CloseWithError(fmt.Errorf("invalid chunk checksum: %s != %s", checksum, chunk.Checksum))
+				return
+			}
+
+			// Write chunk data to pipe
+			if _, err := pw.Write(data); err != nil {
+				pw.CloseWithError(fmt.Errorf("failed to write chunk %d: %w", chunk.Index, err))
+				return
+			}
+
+			// Update file hash
+			hasher.Write(data)
+		}
+
+		// Verify file checksum
+		finalChecksum := hex.EncodeToString(hasher.Sum(nil))
+		if finalChecksum != fileInfo.Checksum {
+			pw.CloseWithError(fmt.Errorf("invalid file checksum: %s != %s", finalChecksum, fileInfo.Checksum))
+		}
+
+	}()
+
+	// Return a reader to the pipe
+	return pr, fileInfo, nil
 }
